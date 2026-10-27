@@ -45,7 +45,7 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 128
+    num_envs: int = 200
     """the number of parallel game environments"""
     num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
@@ -73,6 +73,18 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: Optional[float] = None
     """the target KL divergence threshold"""
+
+    # State transition model arguments
+    st_learning_rate: float = 1e-3
+    """the learning rate of the state transition model optimizer"""
+    st_epochs: int = 8
+    """the number of state transition update epochs per iteration (run after the PPO update)"""
+    st_num_minibatches: int = 8
+    """the number of mini-batches (split across envs so the LSTM sees full time sequences)"""
+    st_done_coef: float = 1.0
+    """weight of the game-over BCE loss"""
+    st_hidden_dim: int = 512
+    """hidden size of the state transition model"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -130,6 +142,11 @@ def mean_item(tensors):
     return torch.stack(tensors).mean().item()
 
 
+@torch.no_grad()
+def encode_in_chunks(agent, x, chunk=1024):
+    return torch.cat([agent.encode(x[i : i + chunk]) for i in range(0, len(x), chunk)], dim=0)
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -180,6 +197,10 @@ if __name__ == "__main__":
 
     agent = Agent(single_action_space.n).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    state_dim = agent.actor.in_features
+    state_transition = StateTransition(single_action_space.n, state_dim=state_dim, hidden_dim=args.st_hidden_dim).to(device)
+    # Only the state transition parameters live in this optimizer, so it can never update the Agent.
+    st_optimizer = optim.Adam(state_transition.parameters(), lr=args.st_learning_rate, eps=1e-5)
 
     # Resume from checkpoint (weights, optimizer state, progress counters)
     start_iteration = 1
@@ -188,6 +209,9 @@ if __name__ == "__main__":
         ckpt = torch.load(args.resume, map_location=device)
         agent.load_state_dict(ckpt["agent"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        if "state_transition" in ckpt:
+            state_transition.load_state_dict(ckpt["state_transition"])
+            st_optimizer.load_state_dict(ckpt["st_optimizer"])
         start_iteration = ckpt["iteration"] + 1
         global_step = ckpt["global_step"]
         print(f"Resumed from {args.resume}: iteration={ckpt['iteration']}, global_step={global_step}")
@@ -218,6 +242,8 @@ if __name__ == "__main__":
             {
                 "agent": agent.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "state_transition": state_transition.state_dict(),
+                "st_optimizer": st_optimizer.state_dict(),
                 "iteration": completed_iteration,
                 "global_step": global_step,
                 "args": vars(args),
@@ -384,6 +410,45 @@ if __name__ == "__main__":
                     break
             update_time = time.time() - update_start
 
+            # State transition update (after the PPO update, on the same rollout buffer).
+            # The Agent is only used to *produce* encoder states under no_grad + detach, so the
+            # state transition loss can never send gradients into Agent.encoder.
+            st_start = time.time()
+            with torch.no_grad():
+                enc = encode_in_chunks(agent, obs.reshape((-1,) + single_observation_space.shape))
+                enc = enc.view(args.num_steps, args.num_envs, -1)
+                all_states = torch.cat([enc, agent.encode(next_obs).unsqueeze(0)], dim=0).detach()  # (T+1, N, D)
+                st_states = all_states[:-1]  # s_t
+                st_targets = all_states[1:]  # s_{t+1}
+                st_actions = actions.long()  # a_t
+                # transition t -> t+1 ends the game iff the next step is flagged done
+                st_done = torch.cat([dones[1:], next_done.unsqueeze(0)], dim=0)  # (T, N)
+            assert not st_states.requires_grad and not st_targets.requires_grad, "encoder states must be detached from the Agent"
+
+            st_losses, st_recons, st_bces, st_accs = [], [], [], []
+            st_env_mb = args.num_envs // args.st_num_minibatches
+            env_inds = np.arange(args.num_envs)
+            for st_epoch in range(args.st_epochs):
+                np.random.shuffle(env_inds)
+                for start in range(0, args.num_envs, st_env_mb):
+                    mb = torch.as_tensor(env_inds[start : start + st_env_mb], device=device)
+                    pred_state, done_logits = state_transition(st_states[:, mb], st_actions[:, mb])
+                    _, recon, bce = state_transition_loss(pred_state, done_logits, st_targets[:, mb], st_done[:, mb])
+                    st_loss = recon + args.st_done_coef * bce
+
+                    st_optimizer.zero_grad()
+                    st_loss.backward()
+                    nn.utils.clip_grad_norm_(state_transition.parameters(), args.max_grad_norm)
+                    st_optimizer.step()
+
+                    with torch.no_grad():
+                        acc = ((done_logits > 0).float() == st_done[:, mb]).float().mean()
+                    st_losses.append(st_loss.detach())
+                    st_recons.append(recon.detach())
+                    st_bces.append(bce.detach())
+                    st_accs.append(acc)
+            st_time = time.time() - st_start
+
             y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
             var_y = np.var(y_true)
             explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
@@ -406,6 +471,12 @@ if __name__ == "__main__":
             writer.add_scalar("losses/clipfrac", mean_item(clipfracs), global_step)
             writer.add_scalar("losses/explained_variance", explained_var, global_step)
             writer.add_scalar("losses/grad_norm", mean_item(grad_norms), global_step)
+            writer.add_scalar("time/state_transition_seconds", st_time, global_step)
+            writer.add_scalar("state_transition/loss", mean_item(st_losses), global_step)
+            writer.add_scalar("state_transition/recon_loss", mean_item(st_recons), global_step)
+            writer.add_scalar("state_transition/done_bce", mean_item(st_bces), global_step)
+            writer.add_scalar("state_transition/done_accuracy", mean_item(st_accs), global_step)
+            writer.add_scalar("state_transition/terminal_fraction", st_done.mean().item(), global_step)
             writer.add_scalar("losses/ratio_max", torch.stack(ratio_maxs).max().item(), global_step)
             writer.add_scalar("losses/ratio_min", torch.stack(ratio_mins).min().item(), global_step)
             if args.hist_every > 0 and iteration % args.hist_every == 0:
