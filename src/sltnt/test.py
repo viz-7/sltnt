@@ -1,11 +1,11 @@
-"""Load a checkpoint, play one full Atari game, render a GIF, and compare the
-StateTransition model's one-step predictions (next state, done, reward) to reality.
+"""Load a checkpoint, play an Atari game, render a GIF, and evaluate the
+StateTransition model's one-step next-state, done, and reward predictions.
 
-With --sltnt the actor primarily sees StateTransition-predicted states.
-The first frame is encoded once, and the ST rolls the state forward.
+The StateTransition model is a two-layer FFN. Its input is:
+    [state(t-2), state(t-1), state(t), one_hot(action(t))]
 
-Every 10 steps, the real environment observation is encoded again. This
-corrected state is passed to both the actor and StateTransition model.
+The initial temporal context is [s0, s0, s0]. In --sltnt mode the actor uses
+predicted states, with an optional real-state correction every --sync-every.
 
 Usage:
     python src/sltnt/test.py --checkpoint runs/<run_name>/ckpt.pt
@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import envpool
 import numpy as np
@@ -46,7 +47,6 @@ class Args:
     seed: int = 1
     cuda: bool = True
     sync_every: int = 10
-    """re-encode the real observation every N steps in --sltnt mode"""
 
 
 def make_env(env_id, seed, **kwargs):
@@ -108,6 +108,15 @@ def to_gif_frame(frame, scale, text=""):
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
+    if args.sync_every < 1:
+        sys.exit("--sync-every must be >= 1.")
+
+    if args.gif_every < 1:
+        sys.exit("--gif-every must be >= 1.")
+
+    if args.fps < 1:
+        sys.exit("--fps must be >= 1.")
+
     device = torch.device(
         "cuda" if torch.cuda.is_available() and args.cuda else "cpu"
     )
@@ -131,10 +140,10 @@ if __name__ == "__main__":
     if "state_transition" not in ckpt:
         sys.exit("Checkpoint has no 'state_transition' weights.")
 
-    if args.sync_every < 1:
-        sys.exit("--sync-every must be >= 1.")
+    # ---------------------------------------------------------
+    # Environments
+    # ---------------------------------------------------------
 
-    # Two pools, same seed and same actions.
     env = make_env(env_id, args.seed)
 
     view_env = make_env(
@@ -148,6 +157,10 @@ if __name__ == "__main__":
 
     n_actions = env.action_space.n
 
+    # ---------------------------------------------------------
+    # Models
+    # ---------------------------------------------------------
+
     agent = Agent(n_actions)
     agent.load_state_dict(ckpt["agent"])
     agent.to(device).eval()
@@ -158,17 +171,24 @@ if __name__ == "__main__":
         ckpt_args.get("st_hidden_dim", 512),
     )
 
-    st.load_state_dict(ckpt["state_transition"])
+    try:
+        st.load_state_dict(ckpt["state_transition"])
+    except RuntimeError as exc:
+        env.close()
+        view_env.close()
+
+        sys.exit(
+            "The checkpoint's StateTransition weights do not match "
+            "the two-layer FFN architecture. Train and save a new "
+            "checkpoint first.\n"
+            f"{exc}"
+        )
+
     st.to(device).eval()
 
-    # LSTM memory is maintained throughout the game.
-    hidden = st.init_hidden(1, device)
-
-    fire = (
-        args.fire_action
-        if 0 <= args.fire_action < n_actions
-        else None
-    )
+    # ---------------------------------------------------------
+    # Initial state
+    # ---------------------------------------------------------
 
     obs, info = env.reset()
     view_obs, _ = view_env.reset()
@@ -177,6 +197,12 @@ if __name__ == "__main__":
     captions = [""]
 
     lives = info["lives"][0]
+
+    fire = (
+        args.fire_action
+        if 0 <= args.fire_action < n_actions
+        else None
+    )
 
     force_fire = fire is not None
 
@@ -188,10 +214,14 @@ if __name__ == "__main__":
 
     mses = []
     done_hits = []
-    r_errs = []
-    r_hits = []
+    reward_errors = []
+    reward_hits = []
 
-    # Initial real observation encoding.
+    # Initial context: [s0, s0, s0].
+    #
+    # history contains [s(t-2), s(t-1)].
+    # state contains s(t).
+
     with torch.no_grad():
         state = agent.encode(
             torch.as_tensor(
@@ -201,20 +231,31 @@ if __name__ == "__main__":
             )
         )
 
+        history = (
+            state.unsqueeze(1)
+            .expand(-1, 2, -1)
+            .clone()
+        )
+
     print(
         f"\n{'step':>5} {'act':>3} {'state MSE':>10} "
-        f"{'pred done':>10} {'pred R':>7} {'true R':>7} "
-        f"{'sync':>6}"
+        f"{'pred done':>10} {'pred R':>7} "
+        f"{'true R':>7} {'sync':>6}"
     )
+
+    # ---------------------------------------------------------
+    # Main rollout
+    # ---------------------------------------------------------
 
     for steps in range(1, args.max_steps + 1):
 
         with torch.no_grad():
 
-            # Actor chooses an action using the current state.
+            # Actor chooses action using current state.
             if force_fire:
                 action = fire
                 force_fire = False
+
             else:
                 logits = agent.actor(state)
 
@@ -227,35 +268,57 @@ if __name__ == "__main__":
                 else:
                     action = logits.argmax(-1).item()
 
-            # StateTransition predicts the next state.
-            pred_state, done_logit, pred_r, hidden = st(
-                state[None],
-                torch.tensor([[action]], device=device),
-                hidden,
+            # Build [s(t-2), s(t-1), s(t)].
+            state_window = torch.cat(
+                [
+                    history,
+                    state.unsqueeze(1),
+                ],
+                dim=1,
             )
 
-        # Execute the same action in the actual environment.
-        actions = np.array([action])
+            action_tensor = torch.tensor(
+                [action],
+                dtype=torch.long,
+                device=device,
+            )
 
-        obs, reward, terminated, truncated, info = env.step(actions)
+            # FFN prediction.
+            pred_state, done_logit, pred_reward = st(
+                state_window,
+                action_tensor,
+            )
 
-        view_obs, *_ = view_env.step(actions)
+        # -----------------------------------------------------
+        # Step real environment
+        # -----------------------------------------------------
 
-        raw_r = float(reward[0])
-        score += raw_r
+        actions_np = np.array([action])
 
-        true_r = float(raw_r > 0)
+        obs, reward, terminated, truncated, info = env.step(
+            actions_np
+        )
+
+        view_obs, *_ = view_env.step(actions_np)
+
+        raw_reward = float(reward[0])
+        score += raw_reward
+
+        true_reward = float(raw_reward > 0)
 
         since_reward = (
-            0 if raw_r > 0 else since_reward + 1
+            0 if raw_reward > 0
+            else since_reward + 1
         )
 
         game_over = bool(terminated[0])
 
+        # -----------------------------------------------------
+        # Compare prediction against reality
+        # -----------------------------------------------------
+
         with torch.no_grad():
 
-            # Encode the actual next observation for diagnostics.
-            # Also used as the actor/ST input at synchronization points.
             true_next = agent.encode(
                 torch.as_tensor(
                     obs,
@@ -265,37 +328,68 @@ if __name__ == "__main__":
             )
 
             mse = (
-                (pred_state[0, 0] - true_next[0]) ** 2
+                (pred_state[0] - true_next[0]) ** 2
             ).mean().item()
 
             done_p = torch.sigmoid(
-                done_logit[0, 0]
+                done_logit[0]
             ).item()
 
-            pr = torch.sigmoid(
-                pred_r[0, 0]
+            reward_p = torch.sigmoid(
+                pred_reward[0]
             ).item()
-
-            # Synchronization logic:
-            #
-            # Every N steps, replace the predicted state with
-            # the encoding of the real environment observation.
-            #
-            # This corrected state becomes the input to BOTH
-            # the actor and StateTransition on the next iteration.
 
             synced = (
                 args.sltnt
                 and steps % args.sync_every == 0
             )
 
-            if args.sltnt:
-                if synced:
-                    state = true_next
-                else:
-                    state = pred_state[0]
-            else:
+            # -------------------------------------------------
+            # Update temporal context
+            # -------------------------------------------------
+
+            if game_over:
+
+                # New episode: initialize all three states
+                # using the new episode's reset observation.
+
                 state = true_next
+
+                history = (
+                    true_next.unsqueeze(1)
+                    .expand(-1, 2, -1)
+                    .clone()
+                )
+
+            else:
+
+                # Shift:
+                #
+                # [s(t-2), s(t-1)] -> [s(t-1), s(t)]
+
+                history = torch.cat(
+                    [
+                        history[:, 1:],
+                        state.unsqueeze(1),
+                    ],
+                    dim=1,
+                )
+
+                # Actor and ST use the same current state.
+                if args.sltnt:
+
+                    state = (
+                        true_next
+                        if synced
+                        else pred_state
+                    )
+
+                else:
+                    state = true_next
+
+        # -----------------------------------------------------
+        # Metrics
+        # -----------------------------------------------------
 
         if not game_over:
             mses.append(mse)
@@ -304,29 +398,33 @@ if __name__ == "__main__":
             (done_p > 0.5) == game_over
         )
 
-        r_errs.append(
+        reward_errors.append(
             -np.log(
-                (pr if true_r else 1 - pr) + 1e-8
+                (reward_p if true_reward else 1.0 - reward_p)
+                + 1e-8
             )
         )
 
-        r_hits.append(
-            (pr > 0.5) == bool(true_r)
+        reward_hits.append(
+            (reward_p > 0.5) == bool(true_reward)
         )
 
         if (
             steps % args.print_every == 0
             or game_over
-            or true_r != 0
+            or true_reward != 0
         ):
             print(
                 f"{steps:>5} {action:>3} {mse:>10.5f} "
-                f"{done_p:>10.3f} {pr:>7.3f} "
-                f"{true_r:>7g} "
+                f"{done_p:>10.3f} {reward_p:>7.3f} "
+                f"{true_reward:>7g} "
                 f"{'YES' if synced else '':>6}"
             )
 
-        # Handle lives and automatic FIRE actions.
+        # -----------------------------------------------------
+        # Lives and FIRE handling
+        # -----------------------------------------------------
+
         new_lives = info["lives"][0]
 
         if fire is not None:
@@ -339,6 +437,10 @@ if __name__ == "__main__":
                 since_reward = 0
 
         lives = new_lives
+
+        # -----------------------------------------------------
+        # GIF frames
+        # -----------------------------------------------------
 
         end = (
             game_over
@@ -353,7 +455,7 @@ if __name__ == "__main__":
                 f"step {steps}\n"
                 f"MSE {mse:.4f}\n"
                 f"done {done_p:.2f}\n"
-                f"R {pr:.2f}/{true_r:g}"
+                f"R {reward_p:.2f}/{true_reward:g}"
                 f"\n{'SYNC' if synced else ''}"
             )
 
@@ -367,8 +469,16 @@ if __name__ == "__main__":
 
             break
 
+    # ---------------------------------------------------------
+    # Cleanup
+    # ---------------------------------------------------------
+
     env.close()
     view_env.close()
+
+    # ---------------------------------------------------------
+    # Results
+    # ---------------------------------------------------------
 
     print(
         f"\nRollout finished: {end_reason} "
@@ -377,7 +487,7 @@ if __name__ == "__main__":
 
     if mses:
         print(
-            f"State MSE (non-terminal): "
+            "State MSE (non-terminal): "
             f"mean={np.mean(mses):.5f} "
             f"median={np.median(mses):.5f} "
             f"max={np.max(mses):.5f}"
@@ -385,9 +495,13 @@ if __name__ == "__main__":
 
     print(
         f"Done accuracy: {np.mean(done_hits):.4f} | "
-        f"Reward BCE: {np.mean(r_errs):.4f} | "
-        f"Reward accuracy: {np.mean(r_hits):.4f}"
+        f"Reward BCE: {np.mean(reward_errors):.4f} | "
+        f"Reward accuracy: {np.mean(reward_hits):.4f}"
     )
+
+    # ---------------------------------------------------------
+    # Save GIF
+    # ---------------------------------------------------------
 
     frame_ms = max(
         10,
@@ -409,8 +523,11 @@ if __name__ == "__main__":
         args.out,
         save_all=True,
         append_images=(
-            to_gif_frame(f, args.scale, c)
-            for f, c in zip(frames[1:], captions[1:])
+            to_gif_frame(frame, args.scale, caption)
+            for frame, caption in zip(
+                frames[1:],
+                captions[1:],
+            )
         ),
         duration=durations,
         loop=0,

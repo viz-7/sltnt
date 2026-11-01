@@ -22,17 +22,18 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64 * 7 * 7, 512)), nn.ReLU(),
         )
         self.actor = layer_init(nn.Linear(512, n_actions), std=0.01)
-        self.critic = layer_init(nn.Linear(512, 1), std=1)
+        self.critic = layer_init(nn.Linear(512, 1), std=1.0)
 
-    def encode(self, x):  # accepts uint8 or float frames
-        return self.encoder(x / 255.0)
+    def encode(self, x):
+        """Encode uint8 or float Atari observations into latent states."""
+        return self.encoder(x.float() / 255.0)
 
     def get_value(self, x):
         return self.critic(self.encode(x))
 
-    def get_action_and_value(self, x, action=None, noise_std = 0.0):
+    def get_action_and_value(self, x, action=None, noise_std=0.0):
         hidden = self.encode(x)
-        if noise_std > 0:  # reparameterization: gradients flow through the encoder
+        if noise_std > 0:
             hidden = hidden + noise_std * torch.randn_like(hidden)
         probs = Categorical(logits=self.actor(hidden))
         if action is None:
@@ -41,58 +42,71 @@ class Agent(nn.Module):
 
 
 class StateTransition(nn.Module):
-    """Predicts next encoded state + game-over logit.
+    """Two-layer FFN predicting the next state, game-over, and reward.
 
-    states: (T, N, D), actions: (T, N), episode_starts: (T, N) bool.
-    episode_starts[t, n] resets only env n's memory before step t.
-    Memory is a tuple (h, c), each (N, hidden_dim).
+    `states` has shape (..., 3, state_dim), ordered as:
+        [state(t-2), state(t-1), state(t)]
+
+    `actions` has shape matching the leading dimensions of `states`.
     """
 
     def __init__(self, n_actions, state_dim=512, hidden_dim=512):
         super().__init__()
-        self.n_actions, self.hidden_dim = n_actions, hidden_dim
-        indim = state_dim + n_actions
-        self.norm = nn.LayerNorm(indim)
-        self.in_ffn = nn.Sequential(layer_init(nn.Linear(indim, hidden_dim)), nn.ReLU())
-        self.lstm = nn.LSTMCell(hidden_dim, hidden_dim)
-        self.out_ffn = nn.Sequential(
-            layer_init(nn.Linear(hidden_dim, hidden_dim)), nn.ReLU(),
-            layer_init(nn.Linear(hidden_dim, state_dim + 2), std=1.0),
+        self.n_actions = n_actions
+        self.state_dim = state_dim
+        self.hidden_dim = hidden_dim
+
+        input_dim = 3 * state_dim + n_actions
+        self.norm = nn.LayerNorm(input_dim)
+        self.fc1 = layer_init(nn.Linear(input_dim, hidden_dim))
+        self.fc2 = layer_init(nn.Linear(hidden_dim, state_dim + 2), std=1.0)
+
+    def forward(self, states, actions):
+        if states.shape[-2] != 3:
+            raise ValueError(
+                f"Expected 3 states in the input window, got {states.shape[-2]}"
+            )
+        if states.shape[-1] != self.state_dim:
+            raise ValueError(
+                f"Expected state dimension {self.state_dim}, got {states.shape[-1]}"
+            )
+
+        action_one_hot = F.one_hot(
+            actions.long(), num_classes=self.n_actions
+        ).to(dtype=states.dtype)
+
+        x = torch.cat(
+            [states.flatten(start_dim=-2), action_one_hot],
+            dim=-1,
         )
+        x = F.relu(self.fc1(self.norm(x)))
+        output = self.fc2(x)
 
-    def init_hidden(self, batch_size, device=None):
-        device = device or next(self.parameters()).device
-        return torch.zeros(batch_size, self.hidden_dim, device=device), torch.zeros(
-            batch_size, self.hidden_dim, device=device
-        )
+        return output[..., :-2], output[..., -2], output[..., -1]
 
-    def forward(self, states, actions, hidden=None, episode_starts=None):
-        """Returns (next_state_pred (T,N,D), done_logits (T,N), (h, c))."""
-        T, N, _ = states.shape
-        a = F.one_hot(actions.long(), self.n_actions).to(states.dtype)
-        x = self.in_ffn(self.norm(torch.cat([states, a], dim=-1)))
 
-        h, c = hidden if hidden is not None else self.init_hidden(N, states.device)
-        keep = (
-            torch.ones(T, N, 1, device=x.device, dtype=x.dtype)
-            if episode_starts is None
-            else (~episode_starts.bool()).to(x.dtype).unsqueeze(-1)
-        )
+def state_transition_loss(
+    pred_state,
+    done_logits,
+    pred_reward,
+    target_state,
+    done_target,
+    reward_target,
+    done_coef=1.0,
+    reward_coef=1.0,
+):
+    """Nonterminal next-state MSE plus game-over and binary-reward BCE."""
+    done_target = done_target.float()
+    reward_target = reward_target.float()
 
-        outs = []
-        for t in range(T):
-            h, c = self.lstm(x[t], (h * keep[t], c * keep[t]))
-            outs.append(h)
-
-        y = self.out_ffn(torch.stack(outs))
-        return y[..., :-2], y[..., -2], y[..., -1], (h, c)
-
-def state_transition_loss(pred_state, done_logits, pred_reward, target_state, done_target,
-                          reward_target, done_coef=1.0, reward_coef=1.0):
-    """MSE on nonterminal next states + BCE on game-over + MSE on (clipped) reward."""
     keep = 1.0 - done_target
-    mse = ((pred_state - target_state) ** 2).mean(-1)
+    mse = ((pred_state - target_state) ** 2).mean(dim=-1)
     recon = (mse * keep).sum() / keep.sum().clamp(min=1.0)
-    bce = F.binary_cross_entropy_with_logits(done_logits, done_target)
-    rew = F.binary_cross_entropy_with_logits(pred_reward, reward_target)
-    return recon + done_coef * bce + reward_coef * rew, recon, bce, rew
+
+    done_bce = F.binary_cross_entropy_with_logits(done_logits, done_target)
+    reward_bce = F.binary_cross_entropy_with_logits(
+        pred_reward, reward_target
+    )
+
+    total = recon + done_coef * done_bce + reward_coef * reward_bce
+    return total, recon, done_bce, reward_bce
