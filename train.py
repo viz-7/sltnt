@@ -46,6 +46,7 @@ class Args:
     ent_coef: float = 0.01
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
+    noise_std: float = 0.1
     target_kl: Optional[float] = None
 
     # State transition
@@ -231,7 +232,7 @@ if __name__ == "__main__":
                 for s in range(0, args.batch_size, args.minibatch_size):
                     mb = perm[s : s + args.minibatch_size]
                     _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                        b_obs[mb], b_actions[mb]
+                        b_obs[mb], b_actions[mb], noise_std=args.noise_std
                     )
                     logratio = newlogprob - b_logprobs[mb]
                     ratio = logratio.exp()

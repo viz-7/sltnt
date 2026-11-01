@@ -30,8 +30,10 @@ class Agent(nn.Module):
     def get_value(self, x):
         return self.critic(self.encode(x))
 
-    def get_action_and_value(self, x, action=None):
+    def get_action_and_value(self, x, action=None, noise_std = 0.0):
         hidden = self.encode(x)
+        if noise_std > 0:  # reparameterization: gradients flow through the encoder
+            hidden = hidden + noise_std * torch.randn_like(hidden)
         probs = Categorical(logits=self.actor(hidden))
         if action is None:
             action = probs.sample()
